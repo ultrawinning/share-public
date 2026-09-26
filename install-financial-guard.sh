@@ -10,7 +10,14 @@ HOOK="$REPO/.git/hooks/pre-commit"
 GUARD="$REPO/.githooks-financial-guard.sh"
 
 [ -f "$GUARD" ] || { echo "❌ guard script missing: $GUARD"; exit 1; }
-[ -f "$HOOK" ]  || { echo "❌ pre-commit hook missing: $HOOK"; exit 1; }
+# A fresh clone has NO pre-commit hook (hooks are local, never cloned). Until 2026-09-26 this
+# refused on that case, so this public repo ran with no guard from its first commit. Create a
+# minimal base hook instead; the splice below then puts the guard above its exit.
+if [ ! -f "$HOOK" ]; then
+  printf '#!/bin/bash\nFAIL=0\n\nexit $FAIL\n' > "$HOOK"
+  chmod +x "$HOOK"
+  echo "created a base pre-commit hook at $HOOK"
+fi
 
 if grep -q 'githooks-financial-guard' "$HOOK"; then
   echo "✅ already installed — nothing to do."
