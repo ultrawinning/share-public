@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><style>body{margin:0;font:14px -apple-system,system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style><script>/* Stand-in for the Claude artifact runtime, so board/wow-board.html runs as a plain web page (bin/board-publish,
+   the player 27 Nov 03:36). It answers the board's own calls from data.json, which bin/board-publish rewrites after each
+   game save: mcp.callTool / mcp.watchTool for list_characters, get_character_sitrep and get_needs, and the db's
+   `steps` (the checklist). Read-only: notes and ticks live on the Claude board, so saving them here fails politely. */
+(() => {
+  let data = null, at = 0, pending = null;
+  const load = () => {
+    if (data && Date.now() - at < 20000) return Promise.resolve(data);  // one fetch shared by every watcher per tick
+    return pending || (pending = fetch(`data.json?t=${Date.now()}`, { cache: "no-store" })
+      .then((r) => { if (!r.ok) throw { code: "tool_error", message: `data.json: HTTP ${r.status}` }; return r.json(); })
+      .then((d) => { data = d; at = Date.now(); return d; })
+      .finally(() => { pending = null; }));
+  };
+  const pick = (d, tool, args) => {
+    const name = args && args.name;
+    if (tool === "list_characters") return d.list_characters;
+    if (tool === "get_character_sitrep" && d.sitrep[name]) return d.sitrep[name];
+    if (tool === "get_needs" && d.needs[name]) return d.needs[name];
+    throw { code: "tool_error", message: `not in this copy: ${tool} ${name || ""}`.trim() };
+  };
+  const asError = (e) => (e && e.code ? e : { code: "tool_error", message: String(e) });
+  const every = (fn, ms) => { fn(); const id = setInterval(fn, ms || 30000); return () => clearInterval(id); };
+
+  const mcp = {
+    async callTool(server, tool, args) { return { payload: pick(await load(), tool, args) }; },
+    watchTool(server, tool, args, cb, opts) {
+      return every(() => load().then((d) => cb({ type: "data", result: { payload: pick(d, tool, args), cache: { storedAt: at } } }),
+        (e) => cb({ type: "error", error: asError(e) })), opts && opts.refetchInterval);
+    },
+  };
+  const readOnly = () => Promise.reject({ code: "read-only copy: use the Claude board" });
+  const db = {
+    collection(name) {
+      return {
+        orderBy() { return this; },
+        add: readOnly,
+        onSnapshot(cb, onErr) {
+          return every(() => load().then((d) => {
+            const rows = name === "steps" ? d.steps || [] : [];
+            cb({ metadata: { fromCache: false }, docs: rows.map((r) => ({ id: r.id, data: () => r })) });
+          }, (e) => onErr && onErr(asError(e))));
+        },
+      };
+    },
+    doc() { return { update: readOnly }; },
+  };
+  window.claude = { use: async (what) => (what === "mcp" ? mcp : what === "db" ? db : null) };
+})();
+</script></head><body>
+<title>Kerana &amp; Gary Board</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout (the player 25 Nov 06:53): one scrolling strip of characters; the selected one as two cards side by side (picture and gear; profile and scratch pad); then every other section folded, closed by default, two columns wide. */
+:root {
+  --bg: #f2f3f5; --panel: #ffffff; --panel-2: #eceef2; --line: #d8dce3;
+  --fg: #1b2028; --muted: #5b6471; --accent: #1f6aa5;
+  --xp: #6a3fb8; --rested: #2f62b8;
+  --gold: #a07510; --silver: #69727e; --copper: #9a5426;
+  --q-red: #c23a33; --q-orange: #c4621a; --q-yellow: #9a7f0a; --q-green: #2b8a45; --q-grey: #7a7f87;
+  --warn-bg: #fff4dc; --warn-fg: #6d4a00;
+  --iq0: #6b6e73; --iq1: #1b2028; --iq2: #1d7f2e; --iq3: #0a5fb4; --iq4: #7d2fc0; --iq5: #b85a00;
+  --tip-bg: #0b1324; --tip-fg: #ffffff; --tip-line: #3a4a6b; --tip-muted: #9aa3ad;
+  --display: "Cinzel", "Trajan Pro", Georgia, serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0f1217; --panel: #171b22; --panel-2: #1e242d; --line: #2a313c;
+  --fg: #e6e3db; --muted: #98a1ad; --accent: #74b4e2;
+  --xp: #9a6ce6; --rested: #4f86e0;
+  --gold: #e2b84c; --silver: #c2c9d2; --copper: #c9814f;
+  --q-red: #ec5a51; --q-orange: #f0913f; --q-yellow: #e6c84a; --q-green: #4fc46c; --q-grey: #8b9098;
+  --warn-bg: #3a2d10; --warn-fg: #f3d58a;
+  --iq0: #9d9d9d; --iq1: #e6e3db; --iq2: #3ddc3d; --iq3: #4aa3ff; --iq4: #b766f2; --iq5: #ff8c1a;
+  color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #0f1217; --panel: #171b22; --panel-2: #1e242d; --line: #2a313c;
+  --fg: #e6e3db; --muted: #98a1ad; --accent: #74b4e2;
+  --xp: #9a6ce6; --rested: #4f86e0;
+  --gold: #e2b84c; --silver: #c2c9d2; --copper: #c9814f;
+  --q-red: #ec5a51; --q-orange: #f0913f; --q-yellow: #e6c84a; --q-green: #4fc46c; --q-grey: #8b9098;
+  --warn-bg: #3a2d10; --warn-fg: #f3d58a;
+  --iq0: #9d9d9d; --iq1: #e6e3db; --iq2: #3ddc3d; --iq3: #4aa3ff; --iq4: #b766f2; --iq5: #ff8c1a;
+  color-scheme: dark }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 14px; line-height: 1.45; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: 16px 40px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 16px; }
+button, input, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); font-weight: 600; margin: 0; }
+
+/* Top bar */
+.top { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; justify-content: space-between; }
+.tab { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 12px 14px; cursor: pointer; display: grid; gap: 6px; text-align: left; min-width: 0; }
+.tab[aria-selected="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tab .ctop { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.tab .ctop b { font-family: var(--display); font-size: 17px; font-weight: 700; }
+.tab .num { font-size: 12.5px; }
+.tab .small { font-size: 12.5px; }
+.mini { height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; position: relative; }
+.mini span { position: absolute; inset: 0 auto 0 0; background: var(--xp); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 11.5px; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--muted); }
+.status { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 12px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--q-grey); flex: none; }
+.dot.live { background: var(--q-green); }
+.dot.warn { background: var(--q-orange); }
+.banner { background: var(--warn-bg); color: var(--warn-fg); border-radius: 8px; padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.banner button { border: 1px solid currentColor; background: transparent; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+
+/* Character strip: one row, scrolls left to right, the selected one outlined. */
+.strip { display: flex; gap: 10px; overflow-x: auto; scroll-snap-type: x proximity; padding-bottom: 6px; scrollbar-width: thin; }
+.strip .tab { flex: 0 0 216px; scroll-snap-align: start; grid-template-columns: 44px minmax(0, 1fr); align-items: center; column-gap: 10px; row-gap: 4px; padding: 10px 12px; }
+.strip .tab .ava { grid-row: span 3; width: 44px; height: 44px; border-radius: 50%; object-fit: cover; object-position: 50% 12%; border: 2px solid var(--line); background: var(--panel-2); }
+.strip .tab[aria-selected="true"] .ava { border-color: var(--accent); }
+.strip .tab .ctop b { font-size: 15px; }
+.strip .tab > :not(.ava) { grid-column: 2; min-width: 0; }
+.strip .tab .money { font-size: 12px; gap: 6px; }
+.strip .tab .meta { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; gap: 6px; }
+/* Hero: two cards side by side, stacked on narrow screens. */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; align-items: start; }
+@media (max-width: 900px) { .hero { grid-template-columns: minmax(0, 1fr); } }
+.side-col { display: grid; gap: 16px; min-width: 0; }
+.kit { padding: 14px; }
+.profile .chips { margin-top: 2px; }
+.profile .chip { font-size: 12px; padding: 2px 9px; }
+/* Folded sections: closed by default; two columns on wide screens, an open one takes the full width. */
+.secs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr)); gap: 12px; align-items: start; }
+details.sec { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; min-width: 0; }
+details.sec > summary { list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 10px; padding: 12px 16px; }
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::before { content: "▸"; color: var(--muted); transition: transform .15s; display: inline-block; }
+details.sec[open] > summary::before { transform: rotate(90deg); }
+details.sec > summary h2 { flex: 1; }
+details.sec > summary:hover h2 { color: var(--fg); }
+details.sec > :not(summary) { margin: 0 16px 14px; }
+details.sec[open] { grid-column: 1 / -1; }
+
+/* Profile strip */
+.profile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; display: grid; gap: 14px; }
+.who { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px; justify-content: space-between; }
+.name { font-family: var(--display); font-size: 28px; font-weight: 700; letter-spacing: .02em; margin: 0; text-wrap: balance; }
+.sub { color: var(--muted); }
+.money { display: inline-flex; gap: 10px; align-items: center; font-size: 16px; }
+.coin { display: inline-flex; align-items: center; gap: 4px; }
+.coin i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.coin.g i { background: var(--gold); } .coin.s i { background: var(--silver); } .coin.c i { background: var(--copper); }
+.xp { display: grid; gap: 6px; }
+.bar { position: relative; height: 14px; background: var(--panel-2); border-radius: 7px; overflow: hidden; border: 1px solid var(--line); }
+.bar span { position: absolute; top: 0; bottom: 0; left: 0; }
+.bar .rested { background: var(--rested); opacity: .35; }
+.bar .cur { background: var(--xp); }
+.xpline { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 13px; }
+.facts { display: flex; flex-wrap: wrap; gap: 6px 22px; font-size: 13px; }
+.facts b { font-weight: 600; }
+
+/* Main grid */
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 10px; min-width: 0; }
+.card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+
+/* Steps */
+details.group { border-top: 1px solid var(--line); padding-top: 8px; }
+details.group:first-of-type { border-top: 0; padding-top: 0; }
+details.group > summary { cursor: pointer; display: flex; justify-content: space-between; gap: 8px; font-weight: 600; list-style: none; padding: 4px 0; }
+details.group > summary::-webkit-details-marker { display: none; }
+details.group > summary::before { content: "▸"; color: var(--muted); margin-right: 6px; transition: transform .15s; display: inline-block; }
+details.group[open] > summary::before { transform: rotate(90deg); }
+details.group > summary .t { flex: 1; min-width: 0; }
+.prog { color: var(--muted); font-size: 12px; font-weight: 500; }
+.prog.done { color: var(--q-green); }
+.steps { list-style: none; margin: 4px 0 6px; padding: 0; display: grid; gap: 6px; }
+.step { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; align-items: start; }
+.step input { width: 16px; height: 16px; margin: 2px 0 0; accent-color: var(--accent); cursor: pointer; }
+.step label { cursor: pointer; }
+.step .more { margin-top: 2px; }
+.step.done label { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
+.plan { list-style: none; margin: 2px 0 6px; padding: 0; display: grid; gap: 5px; font-size: 13px; }
+.plan .detail { display: block; color: var(--muted); font-size: 12.5px; }
+.plan-h { font-size: 13px; font-weight: 600; margin: 6px 0 0; }
+.act { justify-self: start; border: 1px solid var(--accent); color: var(--accent); background: transparent; border-radius: 6px; padding: 4px 12px; cursor: pointer; }
+.jots { max-height: 190px; overflow-y: auto; display: grid; gap: 4px; align-content: start; padding-right: 4px; }
+.jot { display: grid; grid-template-columns: 18px minmax(0, 1fr) max-content; gap: 8px; align-items: baseline; font-size: 13px; cursor: pointer; }
+.jot input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.jot time { color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+.jot.done span { color: var(--muted); text-decoration: line-through; text-decoration-color: var(--line); }
+.jotform { display: flex; gap: 8px; }
+.jotform input { flex: 1; min-width: 0; background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+.saved { font-size: 12px; color: var(--muted); }
+.empty { color: var(--muted); font-size: 13px; }
+
+/* Quests */
+.zone { display: grid; gap: 4px; }
+.zone h3 { font-size: 13px; margin: 6px 0 0; font-weight: 600; }
+.quest { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8px; align-items: baseline; font-size: 13px; }
+.lvl { font-family: var(--mono); font-size: 12px; text-align: center; border-radius: 4px; padding: 0 4px; border: 1px solid currentColor; }
+.lvl.red { color: var(--q-red); } .lvl.orange { color: var(--q-orange); } .lvl.yellow { color: var(--q-yellow); }
+.lvl.green { color: var(--q-green); } .lvl.grey { color: var(--q-grey); }
+.obj { display: block; color: var(--muted); font-size: 12px; }
+.ready { color: var(--q-green); font-weight: 600; font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11.5px; color: var(--muted); }
+
+/* Lists */
+.kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 14px; font-size: 13px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; min-width: 0; }
+.kv dd.gap { color: var(--q-orange); }
+.rank { display: grid; grid-template-columns: minmax(0, 1fr) 90px max-content; gap: 10px; align-items: center; font-size: 13px; }
+.rank .bar { height: 8px; }
+.rank .bar .cur { background: var(--accent); }
+details.more > summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+ul.bul { margin: 4px 0 2px; padding-left: 18px; color: var(--muted); font-size: 12.5px; display: grid; gap: 2px; }
+.picon { width: 16px; height: 16px; border-radius: 4px; vertical-align: -3px; margin-right: 5px; }
+.ptile .ph .picon { width: 20px; height: 20px; vertical-align: -5px; margin-right: 7px; }
+.cols2 { columns: 2 220px; column-gap: 18px; font-size: 13px; }
+.cols2 div { break-inside: avoid; }
+/* Gear: one row per slot with the item's real icon framed in its quality colour; the game-style tooltip opens on hover, focus or tap. */
+.gear { display: grid; gap: 5px; }
+.gslot { display: grid; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; align-items: center; position: relative; }
+.gicon { width: 36px; height: 36px; border-radius: 6px; border: 2px solid var(--iq, var(--line)); background: var(--panel-2); padding: 0; overflow: hidden; cursor: pointer; display: block; }
+.gicon img { width: 100%; height: 100%; display: block; }
+.gname { font-size: 13px; min-width: 0; line-height: 1.25; }
+.gname small { display: block; color: var(--muted); font-size: 11.5px; }
+.gname b { font-weight: 600; color: var(--iq, var(--fg)); overflow-wrap: anywhere; }
+.gslot.empty .gicon { border-style: dashed; cursor: default; }
+.gslot.empty b { color: var(--q-orange); }
+.iq0 { --iq: var(--iq0); } .iq1 { --iq: var(--iq1); } .iq2 { --iq: var(--iq2); } .iq3 { --iq: var(--iq3); } .iq4 { --iq: var(--iq4); } .iq5 { --iq: var(--iq5); }
+.gtip { display: none; position: absolute; z-index: 5; left: 46px; top: 0; width: min(300px, calc(100vw - 96px));
+  background: var(--tip-bg); color: var(--tip-fg); border: 1px solid var(--tip-line); border-radius: 6px; padding: 8px 10px;
+  font-size: 12.5px; line-height: 1.35; box-shadow: 0 8px 24px rgba(0, 0, 0, .35); }
+.gslot:hover .gtip, .gslot:focus-within .gtip, .gslot.open .gtip { display: block; }
+.gtip .row { display: flex; justify-content: space-between; gap: 12px; }
+.gtip .row:first-child { font-weight: 600; font-size: 13.5px; }
+.t-q0 { color: #9d9d9d; } .t-q1 { color: #ffffff; } .t-q2 { color: #1eff00; } .t-q3 { color: #0070dd; } .t-q4 { color: #a335ee; } .t-q5 { color: #ff8000; } .t-q { color: #ffd100; }
+.gtip .src { color: var(--tip-muted); font-size: 11px; margin-top: 6px; }
+/* Last updated line */
+.updated { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.updated b { color: var(--fg); font-weight: 600; }
+.updated .stale { color: var(--q-orange); font-weight: 600; }
+
+/* Professions strip: one tile per profession with its rank bar and next steps, each with what is missing. */
+.ptiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; align-items: start; }
+.ptile { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 7px; align-content: start; min-width: 0; }
+.ptile .ph { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.ptile .ph b { font-size: 13.5px; }
+.ptile .bar { height: 6px; border: 0; }
+.ptile .bar .cur { background: var(--accent); }
+.ptile.capped .ph .num { color: var(--q-orange); font-weight: 600; }
+.psteps { margin: 0; padding-left: 18px; display: grid; gap: 6px; font-size: 12.5px; }
+.psteps .miss { margin: 3px 0 0; padding-left: 14px; color: var(--muted); font-size: 12px; list-style: circle; }
+.psteps .have { display: block; color: var(--q-green); font-size: 12px; }
+.ptile .none { color: var(--muted); font-size: 12px; margin: 0; }
+
+/* Quests: priorities first, then one folded list per zone. */
+.prio { display: grid; gap: 8px; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); }
+.prio h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0; font-weight: 600; }
+.prio ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; }
+.prio .where { display: block; color: var(--muted); font-size: 12px; }
+.fund { display: grid; gap: 4px; font-size: 12.5px; }
+.fund .bar { height: 8px; }
+.fund .bar .cur { background: var(--gold); }
+details.zq { border-top: 1px solid var(--line); padding-top: 6px; }
+details.zq > summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+details.zq > summary .cnt { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+ul.qlist { list-style: none; margin: 6px 0 4px; padding: 0; display: grid; gap: 5px; }
+ul.qlist li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8px; align-items: baseline; font-size: 13px; }
+
+/* Gear as on the character screen: left and right columns of slots around the character, weapons along the bottom. */
+.doll { display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; gap: 10px 12px; }
+.doll .side { display: grid; gap: 6px; align-content: start; }
+.doll .core { display: grid; justify-items: center; align-content: center; gap: 6px; text-align: center; background: var(--panel-2); border-radius: 10px; padding: 14px 8px; min-width: 0; }
+.doll .core img { width: 72px; height: 72px; border-radius: 12px; border: 2px solid var(--line); }
+.doll .core img.avatar { width: auto; height: auto; max-width: 100%; max-height: 360px; border: 0; border-radius: 10px; }
+.doll .core b { font-family: var(--display); font-size: 17px; }
+.doll .core small { color: var(--muted); font-size: 12px; }
+.doll .core small.gap { color: var(--q-orange); font-weight: 600; }
+.fpc { display: grid; gap: 4px; }
+.fpc h3 { font-size: 12px; margin: 2px 0 0; color: var(--muted); font-weight: 600; }
+.chip.fp { color: var(--fg); }
+.chip.fp.miss { color: var(--muted); border-style: dashed; }
+.upg { display: grid; gap: 6px; }
+.upg h3 { font-size: 11.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 6px 0 0; font-weight: 600; }
+.upg ol { margin: 0; padding-left: 20px; display: grid; gap: 5px; font-size: 13px; }
+.upg li.top > span { font-weight: 600; }
+.upg .gain { color: var(--q-green); font-family: var(--mono); font-size: 12px; margin-left: 6px; }
+.ench { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 12px; font-size: 12.5px; }
+.ench dt { color: var(--muted); }
+.ench dd { margin: 0; min-width: 0; }
+.upg .note { color: var(--muted); font-size: 12px; margin: 0; }
+.doll .weapons { grid-column: 1 / -1; display: flex; justify-content: center; gap: 10px; }
+.dslot { position: relative; }
+.dslot .gicon { width: 44px; height: 44px; }
+.dslot.empty .gicon { display: grid; place-items: center; font-size: 9px; line-height: 1.1; color: var(--muted); text-align: center; }
+.dslot .gtip { top: 0; left: 52px; }
+.side.r .dslot .gtip { left: auto; right: 52px; }
+.weapons .dslot .gtip { top: auto; bottom: 52px; left: 50%; transform: translateX(-50%); }
+.dslot:hover .gtip, .dslot:focus-within .gtip, .dslot.open .gtip { display: block; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <div class="top">
+    <h2>Characters</h2>
+    <div class="status" id="status"><span class="dot"></span><span>Connecting to the game data…</span></div>
+  </div>
+  <!-- the player 25 Nov 06:53: one strip of every character, scrolling left to right. -->
+  <div class="strip" id="tabs" role="tablist" aria-label="Characters"></div>
+  <div class="banner" id="banner" hidden></div>
+
+  <!-- The selected character as two cards side by side: picture and gear, then the profile with its scratch pad. -->
+  <div class="hero">
+    <section class="card kit" aria-label="Picture and gear"><div id="gear"><p class="empty">The character and its gear appear once the game data loads.</p></div></section>
+    <div class="side-col">
+      <section class="profile" id="profile" aria-live="polite">
+        <div class="who"><p class="name">Character board</p><span class="sub">Waiting for the game data from your Mac.</span></div>
+      </section>
+      <!-- the player 25 Nov: a scratch pad per character, like a small chat: notes stack up with their time and can be ticked off (db jots; Claude reads it too). -->
+      <section class="card">
+        <div class="card-head"><h2 id="notesHead">Scratch pad</h2><span class="saved" id="savedNote"></span></div>
+        <div id="jots" class="jots" role="log" aria-label="Notes"><p class="empty">Your notes for this character appear here.</p></div>
+        <form id="jotForm" class="jotform"><input id="jot" type="text" autocomplete="off" placeholder="Type a note and press Enter" aria-label="New note"><button type="submit" class="act">Add</button></form>
+      </section>
+    </div>
+  </div>
+
+  <!-- Every other section folds, closed by default; the header carries its count. Open ones stay open across visits. -->
+  <div class="secs">
+    <details class="sec" id="sec-steps"><summary><h2>Next steps</h2><span class="prog" id="stepsProg"></span></summary>
+      <div id="steps"><p class="empty">Claude adds the next steps here. Tick them off as you go; Claude sees what you ticked.</p></div></details>
+    <details class="sec" id="sec-upgrades"><summary><h2>Upgrades and enchants</h2><span class="prog" id="upgAge"></span></summary>
+      <div id="upgrades"><p class="empty">The next items and enchants appear once the game data loads.</p></div></details>
+    <details class="sec" id="sec-profs"><summary><h2>Professions</h2><span class="prog" id="profAge"></span></summary>
+      <div id="profs" class="ptiles"><p class="empty">Each profession's next steps, and what is missing for them, appear once the game data loads.</p></div></details>
+    <details class="sec" id="sec-quests"><summary><h2>Quests</h2><span class="prog" id="questCount"></span></summary>
+      <div class="legend"><span><b class="lvl red">L</b> too hard</span><span><b class="lvl orange">L</b> hard</span><span><b class="lvl yellow">L</b> even</span><span><b class="lvl green">L</b> easy</span><span><b class="lvl grey">L</b> grey, little XP</span></div>
+      <div id="quests"><p class="empty">Quests appear once the game data loads.</p></div></details>
+    <details class="sec" id="sec-plan"><summary><h2>Plan</h2><span class="prog" id="planAge"></span></summary>
+      <div id="plan"><p class="empty">The roster plan for this character appears once the game data loads: mail coming to it, what to buy and where to farm.</p></div></details>
+    <details class="sec" id="sec-flights"><summary><h2>Flight paths</h2><span class="prog" id="fpAge"></span></summary>
+      <div id="flights"><p class="empty">Flight paths appear once the game data loads.</p></div></details>
+    <details class="sec" id="sec-extra"><summary><h2>Bags, talents and money</h2><span class="prog" id="extraAge"></span></summary>
+      <div id="extra"><p class="empty">Appears once the game data loads.</p></div></details>
+  </div>
+</div>
+
+<script>
+const SERVER = "host:wow-companion";
+const REFRESH_MS = 30000;
+const SLOT_ORDER = ["Head", "Neck", "Shoulder", "Back", "Chest", "Shirt", "Wrist", "Hands", "Waist", "Legs", "Feet",
+  "Finger 1", "Finger 2", "Trinket 1", "Trinket 2", "Main Hand", "Off Hand", "Ranged"];
+const GAP_SLOTS = new Set(["Head", "Neck", "Shoulder", "Back", "Chest", "Wrist", "Hands", "Waist", "Legs", "Feet", "Main Hand", "Ranged"]);
+
+const S = { chars: [], sel: null, sitreps: {}, sectionErr: {}, steps: [], jots: [], jotScroll: false, mcp: null, db: null,
+  host: "connecting", watched: new Set(), openGroups: {},
+  plan: {}, planErr: {}, planFor: null, planStop: null, fetchedAt: {} };
+
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n) => Number(n).toLocaleString("en-US");
+const val = (section) => (section && typeof section === "object" && "value" in section) ? section.value : null;
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+// Classic quest colours. Grey level matches WarcraftDB Forever's colour bands (checked at levels 22-33).
+function greyLevel(L) { return L <= 5 ? 0 : L < 40 ? L - 5 - Math.floor(L / 10) : L - 1 - Math.floor(L / 5); }
+function questColour(q, L) {
+  const d = q - L;
+  if (d >= 5) return "red";
+  if (d >= 3) return "orange";
+  if (d >= -2) return "yellow";
+  return q > greyLevel(L) ? "green" : "grey";
+}
+
+function coins(copper) {
+  const g = Math.floor(copper / 10000), s = Math.floor(copper / 100) % 100, c = copper % 100;
+  const parts = [];
+  if (g) parts.push(`<span class="coin g num"><i></i>${g}g</span>`);
+  if (g || s) parts.push(`<span class="coin s num"><i></i>${s}s</span>`);
+  parts.push(`<span class="coin c num"><i></i>${c}c</span>`);
+  return parts.join("");
+}
+
+function when(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "unknown" : d.toLocaleString("en-GB", { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+}
+function updatedLine(sr) {
+  const at = sr.snapshot_captured_at, old = at && Date.now() - Date.parse(at) > 6 * 3600000;
+  const heard = S.fetchedAt[sr.character];
+  return `<div class="updated"><span>Last updated <b>${esc(when(at))}</b> <span class="${old ? "stale" : ""}">(${esc(ago(at))})</span></span>`
+    + `<span>from the last /reload or logout on this character</span>`
+    + (heard ? `<span>board checked ${esc(new Date(heard).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }))}</span>` : "") + `</div>`;
+}
+
+function ago(iso) {
+  if (!iso) return "unknown";
+  const m = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  return h < 24 ? `${h} h ${m % 60} min ago` : `${Math.floor(h / 24)} days ago`;
+}
+
+/* ---------- live game data (local MCP server on the Mac) ---------- */
+function setHost(state, msg) {
+  S.host = state;
+  const dot = state === "live" ? "live" : state === "connecting" ? "" : "warn";
+  const sr = S.sel && S.sitreps[S.sel];
+  const text = msg || (state === "live" && sr ? `Live · ${esc(S.sel)} saved ${ago(sr.snapshot_captured_at)} · updates after each /reload` : "Connecting to the game data…");
+  document.getElementById("status").innerHTML = `<span class="dot ${dot}"></span><span>${text}</span>`;
+}
+
+function showBanner(html, action) {
+  const b = document.getElementById("banner");
+  if (!html) { b.hidden = true; b.innerHTML = ""; return; }
+  b.hidden = false;
+  b.innerHTML = `<span>${html}</span>` + (action ? `<button type="button" id="bannerBtn">${esc(action.label)}</button>` : "");
+  if (action) document.getElementById("bannerBtn").onclick = action.run;
+}
+
+function hostError(err, clearData) {
+  const code = err && err.code;
+  if (code === "server_not_connected") {
+    showBanner("Live game data only works in the Claude desktop app on your Mac. If you are in the app, quit it with ⌘Q and open it again so it starts the WoW data server (wow-companion).");
+    setHost("off", "Game data not reachable here");
+  } else if (code === "approval_required" || code === "not_in_manifest") {
+    showBanner("The board needs your OK to read the game data on this Mac.", { label: "Allow game data", run: allowOnce });
+    setHost("off", "Waiting for your OK");
+  } else if (code === "not_granted" || code === "capability_disabled" || code === "capability_removed") {
+    showBanner("This view can't read game data. Open the board in the Claude desktop app on your Mac.");
+    setHost("off", "Game data off in this view");
+  } else if (code === "cancelled") {
+    showBanner("The game data read was declined.", { label: "Try again", run: allowOnce });
+    setHost("off", "Declined");
+  } else {
+    setHost("warn", `Game data reconnecting (${esc(code || "error")}) · showing the last data`);
+    return;
+  }
+  if (clearData) { S.sitreps = {}; render(); }
+}
+
+async function allowOnce() {
+  if (!S.mcp) return;
+  try {
+    const r = await S.mcp.callTool(SERVER, "list_characters", null);
+    showBanner(null);
+    onCharacters(r.payload);
+  } catch (e) { hostError(e, false); }
+}
+
+function onCharacters(payload) {
+  const list = ((payload && payload.characters) || []).slice().sort((a, b) => (b.level || 0) - (a.level || 0) || a.name.localeCompare(b.name));
+  if (!list.length) return;
+  S.chars = list;
+  const saved = store.get("wowboard.sel");
+  // Default to whoever was saved most recently: the character being played.
+  const newest = list.slice().sort((a, b) => String(b.snapshot_captured_at || "").localeCompare(String(a.snapshot_captured_at || "")))[0].name;
+  if (!S.sel || !list.some((c) => c.name === S.sel)) S.sel = list.some((c) => c.name === saved) ? saved : newest;
+  for (const c of list) watchCharacter(c.name);
+  renderTabs();
+  watchPlan();
+}
+
+/* ---------- the roster plan for the selected character (bin/kb, rebuilt after every save) ---------- */
+function watchPlan() {
+  if (!S.mcp || !S.sel || S.planFor === S.sel) return;
+  if (S.planStop) S.planStop();
+  const name = S.planFor = S.sel;
+  S.planStop = S.mcp.watchTool(SERVER, "get_needs", { name }, (ev) => {
+    if (ev.type === "data") {
+      const p = ev.result.payload || {};
+      S.plan[name] = { lines: Array.isArray(p.lines) ? p.lines : [], at: (ev.result.cache && ev.result.cache.storedAt) || Date.now() };
+      delete S.planErr[name];
+    } else {
+      const code = ev.error && ev.error.code;
+      if (code === "tool_error") S.planErr[name] = { text: `The plan could not be read: ${ev.error.message || "unknown error"}.` };
+      else if (code === "approval_required" || code === "not_in_manifest") S.planErr[name] = { text: "The board needs your OK to read the roster plan.", allow: true };
+      else if (["server_not_connected", "not_granted", "capability_disabled", "capability_removed", "blocked_by_policy", "cancelled"].includes(code)) {
+        delete S.plan[name];
+        S.planErr[name] = { text: "The plan needs the game data from your Mac (see the note at the top)." };
+      } else S.planErr[name] = { text: `The plan is reconnecting (${code || "error"}); showing the last one.` };
+    }
+    if (name === S.sel) renderPlan();
+  }, { refetchInterval: REFRESH_MS, cache: { staleTime: REFRESH_MS - 5000, gcTime: 7 * 86400000 } });
+}
+
+async function allowPlan() {
+  const name = S.sel;
+  try {
+    await S.mcp.callTool(SERVER, "get_needs", { name });
+    S.planFor = null;
+    watchPlan();
+  } catch (e) {
+    S.planErr[name] = { text: e && e.code === "cancelled" ? "The plan read was declined." : `The plan could not be read (${(e && e.code) || "error"}).`, allow: e && e.code === "cancelled" };
+    renderPlan();
+  }
+}
+
+function renderPlan() {
+  const el = document.getElementById("plan"), age = document.getElementById("planAge");
+  if (!S.mcp || !S.sel) return;
+  const p = S.plan[S.sel], err = S.planErr[S.sel];
+  if (!p) {
+    age.textContent = "";
+    el.innerHTML = err ? `<p class="empty">${esc(err.text)}</p>` + (err.allow ? `<button type="button" class="act" id="planAllow">Allow the plan</button>` : "")
+                       : `<p class="empty">Loading the plan for ${esc(S.sel)}…</p>`;
+    const b = document.getElementById("planAllow");
+    if (b) b.onclick = allowPlan;
+    return;
+  }
+  age.textContent = err ? err.text : `updated ${ago(new Date(p.at).toISOString())}`;
+  const head = `Of the roster plan, what reaches ${S.sel}:`;
+  const cut = p.lines.indexOf(head);
+  const needs = cut < 0 ? p.lines : p.lines.slice(0, cut);
+  // Mail, Buy and Find, each line an item; a farm line belongs to the item above it.
+  const sections = [];
+  for (const raw of cut < 0 ? [] : p.lines.slice(cut + 1)) {
+    const line = raw.trim();
+    if (!raw.startsWith(" ")) sections.push({ name: line.replace(/:$/, ""), items: [] });
+    else if (line.startsWith("farm:") && sections.length && sections[sections.length - 1].items.length) {
+      const items = sections[sections.length - 1].items;
+      items[items.length - 1].farm.push(line.slice(5).trim());
+    } else if (line && line !== "nothing") {
+      if (!sections.length) sections.push({ name: "Plan", items: [] });
+      sections[sections.length - 1].items.push({ text: line, farm: [] });
+    }
+  }
+  const coming = sections.filter((s) => s.items.length);
+  const n = coming.reduce((t, s) => t + s.items.length, 0);
+  const item = (i) => `<li>${esc(i.text)}${i.farm.map((f) => `<span class="detail">Farm: ${esc(f)}</span>`).join("")}</li>`;
+  el.innerHTML = (cut < 0
+      ? `<p class="empty">The game data server on this Mac is an older version. Quit the Claude desktop app with ⌘Q and open it again to see mail, buys and farm spots here.</p>`
+      : n ? `<details class="more" open><summary>Coming to ${esc(S.sel)} (${n})</summary>` +
+            coming.map((s) => `<p class="plan-h">${esc(s.name)}</p><ul class="plan">${s.items.map(item).join("")}</ul>`).join("") + `</details>`
+          : `<p class="empty">Nothing in the roster plan is headed to ${esc(S.sel)}.</p>`) +
+    (needs.length ? `<details class="more"><summary>What ${esc(S.sel)}'s goals need (${needs.length})</summary><ul class="plan">${needs.map((l) => `<li>${esc(l)}</li>`).join("")}</ul></details>` : "");
+}
+
+function watchCharacter(name) {
+  if (S.watched.has(name)) return;
+  S.watched.add(name);
+  S.mcp.watchTool(SERVER, "get_character_sitrep", { name }, (ev) => {
+    if (ev.type === "data") {
+      S.sitreps[name] = ev.result.payload;
+      S.fetchedAt[name] = Date.now();
+      delete S.sectionErr[name];
+      showBanner(null);
+      setHost("live");
+      renderTabs();
+      if (name === S.sel) renderLive();
+    } else {
+      const authz = ["server_not_connected", "approval_required", "not_in_manifest", "not_granted", "capability_disabled", "blocked_by_policy"];
+      if (ev.error && ev.error.code === "tool_error") { S.sectionErr[name] = ev.error.message; if (name === S.sel) renderLive(); }
+      else hostError(ev.error, authz.includes(ev.error && ev.error.code));
+    }
+  }, { refetchInterval: REFRESH_MS, cache: { staleTime: REFRESH_MS - 5000, gcTime: 7 * 86400000 } });
+}
+
+async function startLive() {
+  S.mcp = await claude.use("mcp");
+  if (!S.mcp) { hostError({ code: "not_granted" }, false); return; }
+  S.mcp.watchTool(SERVER, "list_characters", null, (ev) => {
+    if (ev.type === "data") onCharacters(ev.result.payload);
+    else hostError(ev.error, ["server_not_connected", "not_granted"].includes(ev.error && ev.error.code));
+  }, { refetchInterval: REFRESH_MS, cache: { staleTime: REFRESH_MS - 5000, gcTime: 7 * 86400000 } });
+}
+
+/* ---------- checklist + notes (the page's own database; Claude reads it) ---------- */
+async function startDb() {
+  S.db = await claude.use("db");
+  if (!S.db) {
+    document.getElementById("steps").innerHTML = `<p class="empty">Sign in to claude.ai to see and tick the next steps.</p>`;
+    document.getElementById("jot").disabled = true;
+    return;
+  }
+  const slow = setTimeout(() => { document.getElementById("stepsProg").textContent = "can't reach the saved steps yet"; }, 10000);
+  S.db.collection("steps").orderBy("order").onSnapshot((snap) => {
+    if (!snap.metadata || !snap.metadata.fromCache) clearTimeout(slow);
+    S.steps = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    if (!S.sel && S.steps.length) { S.sel = S.steps[0].char; renderNotes(true); }
+    renderTabs();
+    renderSteps();
+    const sr = S.sel && S.sitreps[S.sel];  // priorities and profession goals come from the steps
+    if (sr) { renderQuests(sr, val(sr.level)); renderProfs(sr); }
+  }, (e) => { clearTimeout(slow); document.getElementById("stepsProg").textContent = `steps unavailable (${e.code})`; });
+  S.db.collection("jots").orderBy("at").onSnapshot((snap) => {
+    S.jots = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    renderNotes(false);
+  }, (e) => { document.getElementById("savedNote").textContent = `notes unavailable (${e.code})`; });
+}
+
+async function toggleStep(id, done) {
+  try { await S.db.doc(`steps/${id}`).update({ done, doneAt: done ? new Date().toISOString() : null }); }
+  catch (e) { document.getElementById("stepsProg").textContent = `couldn't save that tick (${e.code}); try again`; renderSteps(); }
+}
+
+async function addJot(e) {
+  e.preventDefault();
+  const box = document.getElementById("jot"), text = box.value.trim();
+  if (!text || !S.db || !S.sel) return;
+  box.value = "";
+  S.jotScroll = true;
+  try {
+    await S.db.collection("jots").add({ char: S.sel, text, at: new Date().toISOString(), done: false });
+    document.getElementById("savedNote").textContent = "";
+  } catch (err) {
+    box.value = text;
+    document.getElementById("savedNote").textContent = `Not saved (${err.code}); press Enter to try again`;
+  }
+}
+async function tickJot(id, done) {
+  try { await S.db.doc(`jots/${id}`).update({ done, doneAt: done ? new Date().toISOString() : null }); }
+  catch (e) { document.getElementById("savedNote").textContent = `couldn't save that tick (${e.code}); try again`; renderNotes(false); }
+}
+
+/* ---------- rendering ---------- */
+function renderTabs() {
+  // Without live data (a browser tab), the tabs come from the saved steps so the checklist still works.
+  const names = S.chars.length ? S.chars.map((c) => c.name) : [...new Set(S.steps.map((s) => s.char))];
+  // One compact card per character in a single scrolling strip (the player 25 Nov 06:53): picture, level, XP, gold, save age.
+  document.getElementById("tabs").innerHTML = names.map((n) => {
+    const c = S.chars.find((x) => x.name === n) || {};
+    const sr = S.sitreps[n];
+    const lvl = val(sr && sr.level) ?? c.level;
+    const xp = sr && val(sr.xp), money = sr && val(sr.money);
+    const ava = AVATARS.has(n) ? `<img class="ava" src="avatars/${esc(n.toLowerCase())}.jpg" alt="">` : `<span class="ava" aria-hidden="true"></span>`;
+    return `<button type="button" class="tab" role="tab" id="tab-${esc(n)}" aria-selected="${n === S.sel}" data-name="${esc(n)}">${ava}
+      <span class="ctop"><b>${esc(n)}</b><span class="num">${lvl != null ? "L" + esc(lvl) : ""}</span><span class="muted small">${esc((sr && sr.class) || c.class || "")}</span></span>
+      <span class="mini" aria-hidden="true"><span style="width:${xp ? Math.min(100, xp.current / xp.max * 100) : 0}%"></span></span>
+      <span class="meta"><span class="money">${money ? coins(money.copper) : ""}</span><span>${sr ? esc(ago(sr.snapshot_captured_at)) : ""}</span></span>
+    </button>`;
+  }).join("");
+  document.querySelectorAll(".tab").forEach((b) => b.onclick = () => select(b.dataset.name));
+}
+
+function select(name) {
+  if (name === S.sel) return;
+  S.sel = name;
+  store.set("wowboard.sel", name);
+  render();
+  const tab = document.getElementById(`tab-${name}`);
+  if (tab && tab.scrollIntoView) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function render() { renderTabs(); renderLive(); renderSteps(); renderNotes(true); watchPlan(); renderPlan(); }
+
+function renderLive() {
+  const sr = S.sel && S.sitreps[S.sel];
+  const prof = document.getElementById("profile");
+  if (!sr) {
+    prof.innerHTML = `<div class="who"><p class="name">${esc(S.sel || "Character board")}</p><span class="sub">${S.sectionErr[S.sel] ? "Game data error: " + esc(S.sectionErr[S.sel]) : "Waiting for the game data from your Mac."}</span></div>`;
+    return;
+  }
+  if (S.host === "live") setHost("live");
+  const L = val(sr.level), xp = val(sr.xp), loc = val(sr.location), money = val(sr.money);
+  const pct = xp ? Math.min(100, (xp.current / xp.max) * 100) : 0;
+  const restPct = xp && xp.rested ? Math.min(100, ((xp.current + xp.rested) / xp.max) * 100) : 0;
+  const dm = val(sr.darkmoon);
+  prof.innerHTML = `
+    <div class="who">
+      <div><p class="name">${esc(sr.character)}</p>
+        <span class="sub">Level ${esc(L ?? "?")} ${esc(sr.race)} ${esc(sr.class)} · ${esc(sr.realm)}</span></div>
+      <div class="money" title="Gold as of the last save">${money ? coins(money.copper) : '<span class="muted">gold unknown</span>'}</div>
+    </div>
+    ${xp ? `<div class="xp">
+      <div class="bar" role="img" aria-label="XP ${fmt(xp.current)} of ${fmt(xp.max)}"><span class="rested" style="width:${restPct}%"></span><span class="cur" style="width:${pct}%"></span></div>
+      <div class="xpline"><span class="num">${fmt(xp.current)} / ${fmt(xp.max)} XP (${xp.percent}%)</span>
+        <span><b class="num">${fmt(xp.max - xp.current)}</b> to level ${esc((L ?? 0) + 1)}</span>
+        ${xp.rested ? `<span class="muted">rested <span class="num">${fmt(xp.rested)}</span></span>` : ""}</div>
+    </div>` : `<p class="muted">XP unknown</p>`}
+    <div class="facts">
+      ${loc ? `<span><b>${esc(loc.subzone || loc.zone)}</b>${loc.subzone ? ", " + esc(loc.zone) : ""} <span class="num muted">(${esc(loc.x)}, ${esc(loc.y)})</span></span><span class="muted">Hearth: ${esc(loc.hearth || "unknown")}</span>` : `<span class="muted">Location unknown</span>`}
+      ${val(sr.talent_points_spent) != null ? `<span class="muted">Talent points spent: <span class="num">${esc(val(sr.talent_points_spent))}</span></span>` : ""}
+      ${dm ? `<span class="muted">Darkmoon: <span class="num">${esc(dm.tickets)}</span> tickets, rep <span class="num">${fmt(dm.reputation)}</span></span>` : ""}
+    </div>
+    ${(val(sr.professions) || []).length ? `<span class="chips">${val(sr.professions).map((p) => `<span class="chip">${profImg(p.name)}${esc(p.name)} <span class="num">${esc(p.rank)}/${esc(p.max)}</span></span>`).join("")}</span>` : ""}
+    ${updatedLine(sr)}`;
+
+  renderQuests(sr, L);
+  renderGear(sr);
+  renderProfs(sr);
+  renderFlights(sr);
+  renderExtra(sr);
+}
+
+// Flight paths (the player 25 Nov: "what FP mac has"): known ones by continent, then dashed the ones another character has
+// learned and this one has not. A path nobody on the roster knows is not listed.
+function renderFlights(sr) {
+  const el = document.getElementById("flights"), age = document.getElementById("fpAge"), f = sr.flights;
+  age.textContent = "";
+  if (!f) { el.innerHTML = `<p class="empty">Flight paths need the new game-data bridge: quit and reopen the Claude app.</p>`; return; }
+  if (!f.at) { el.innerHTML = `<p class="empty">Not recorded yet: open the flight map at any flight master, then /reload.</p>`; return; }
+  const count = (o) => Object.values(o || {}).reduce((t, l) => t + l.length, 0);
+  age.textContent = `${count(f.known)} known · ${count(f.missing)} not yet · as of ${ago(f.at)}`;
+  const conts = ["Eastern Kingdoms", "Kalimdor", "Other"].filter((c) => (f.known[c] || []).length || (f.missing[c] || []).length);
+  el.innerHTML = conts.map((c) => `<div class="fpc"><h3>${esc(c)}</h3><span class="chips">`
+      + (f.known[c] || []).map((x) => `<span class="chip fp" title="${esc(x)}">${esc(x.split(", ")[0])}</span>`).join("")
+      + (f.missing[c] || []).map((x) => `<span class="chip fp miss" title="${esc(x.name)}: ${esc(x.known_by.join(", "))} has it">${esc(x.name.split(", ")[0])}</span>`).join("")
+      + `</span></div>`).join("")
+    + `<div class="legend"><span class="chip fp">known</span><span class="chip fp miss">not yet: another character has it</span></div>`;
+}
+
+// Quests: the character's priorities first (its open board steps and the mount fund), then one folded list per zone,
+// the zone the character stands in open.
+function renderQuests(sr, L) {
+  const qs = val(sr.quests);
+  const el = document.getElementById("quests");
+  const loc = val(sr.location);
+  const mine = S.steps.filter((s) => s.char === sr.character && !s.done).slice(0, 3);
+  const funds = Array.isArray(sr.savings) ? sr.savings : [];
+  const prio = mine.length || funds.length ? `<div class="prio"><h3>Priorities</h3>`
+    + funds.map((f) => {
+      const pct = f.need ? Math.min(100, f.have / f.need * 100) : 0;
+      return `<div class="fund"><span>${esc(f.text)}</span><div class="bar" role="img" aria-label="${Math.round(pct)} percent saved"><span class="cur" style="width:${pct}%"></span></div>`
+        + `<span class="num">${coins(f.have)} <span class="muted">of</span> ${coins(f.need)} <span class="muted">(${Math.floor(pct)}%; ${f.parts.map((x) => `${esc(x.name)} ${esc(sinceText(x.copper))}`).join(" + ")})</span></span></div>`;
+    }).join("")
+    + (mine.length ? `<ul>${mine.map((s) => `<li>${esc(s.text)}${more(s.detail)}</li>`).join("")}</ul>` : "")
+    + `</div>` : "";
+  if (!qs) { el.innerHTML = prio + `<p class="empty">Quest log unknown in the last save.</p>`; document.getElementById("questCount").textContent = ""; return; }
+  const ready = qs.filter((q) => q.ready_to_hand_in).length;
+  document.getElementById("questCount").textContent = `${qs.length}/40 in log · ${ready} ready`;
+  const zones = {};
+  for (const q of qs) (zones[q.zone || "Other"] ||= []).push(q);
+  const here = loc && loc.zone;
+  const list = Object.entries(zones).sort((a, b) => (b[0] === here) - (a[0] === here) || a[0].localeCompare(b[0]));
+  const row = (q) => {
+    const col = L && q.level ? questColour(q.level, L) : "grey";
+    const objs = q.ready_to_hand_in ? "" : (q.objectives || []).filter((o) => !o.done).map((o) => `<span class="obj">${esc(o.text)}</span>`).join("");
+    return `<li><span class="lvl ${col}">${esc(q.level ?? "?")}</span><span>${esc(q.title)}${q.ready_to_hand_in ? ' <span class="ready">ready</span>' : ""}${objs}</span></li>`;
+  };
+  const key = (z) => `${sr.character}|q|${z}`;
+  el.innerHTML = prio + list.map(([z, l]) => {
+    const r = l.filter((q) => q.ready_to_hand_in).length;
+    const open = key(z) in S.openGroups ? S.openGroups[key(z)] : z === here;
+    const sorted = l.slice().sort((a, b) => b.ready_to_hand_in - a.ready_to_hand_in || (a.level || 0) - (b.level || 0));
+    return `<details class="zq" data-key="${esc(key(z))}" ${open ? "open" : ""}><summary>${esc(z)}<span class="cnt">${l.length} quest${l.length === 1 ? "" : "s"}${r ? `, ${r} ready` : ""}${z === here ? " · you are here" : ""}</span></summary>`
+      + `<ul class="qlist">${sorted.map(row).join("")}</ul></details>`;
+  }).join("") || prio + `<p class="empty">Quest log is empty.</p>`;
+  el.querySelectorAll("details.zq").forEach((d) => d.addEventListener("toggle", () => { S.openGroups[d.dataset.key] = d.open; }));
+}
+function sinceText(copper) { const g = Math.floor(copper / 10000), s = Math.floor(copper / 100) % 100; return g ? `${g}g ${s}s` : `${s}s`; }
+
+const ICON_RE = /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/;
+// Profession icons (Wowhead icon names), published next to the page as icons/<name>.jpg from board/icons/.
+const PROF_ICON = { Alchemy: "trade_alchemy", Blacksmithing: "trade_blacksmithing", Enchanting: "trade_engraving", Engineering: "trade_engineering",
+  Herbalism: "trade_herbalism", Leatherworking: "trade_leatherworking", Mining: "trade_mining", Skinning: "inv_misc_pelt_wolf_01",
+  Tailoring: "trade_tailoring", Cooking: "inv_misc_food_15", "First Aid": "spell_holy_sealofsacrifice", Fishing: "trade_fishing" };
+const profImg = (name) => PROF_ICON[name] ? `<img class="picon" src="icons/${PROF_ICON[name]}.jpg" alt="">` : "";
+// Character pictures cropped from the player's screenshots (board/avatars/<name>.jpg, published as avatars/): a name goes here once its file is published.
+const AVATARS = new Set(["Gary", "Bank", "Kerana", "Macragge", "Kolchak", "Suzy", "Keraera", "Graham"]);  // the player's screenshots, 25 Nov 05:07
+// the player 25 Nov: headline only; the description folds away as bullets, one per sentence.
+const more = (t) => t ? `<details class="more"><summary>more</summary><ul class="bul">${String(t).split(/(?<=[.;])\s+(?=[A-Z(])/)
+  .map((x) => `<li>${esc(x.replace(/\.$/, ""))}</li>`).join("")}</ul></details>` : "";
+const HEX_RE = /^[0-9a-f]{6}$/;
+// The tooltip: the game's own lines when the save has them (colours as the game drew them), else Wowhead's Forever card.
+function tipHtml(g, q) {
+  const t = g.tooltip;
+  if (!t || !Array.isArray(t.lines) || !t.lines.length)  // the bridge before 25 Nov sent no quality field at all
+    return `<div class="gtip" role="tooltip"><div class="row t-q${q}"><span>${esc(g.name)}</span></div><div class="src">${"quality" in g
+      ? "No tooltip cached yet: it arrives with the next save." : "Icons and tooltips need the new game-data bridge: quit and reopen the Claude app."}</div></div>`;
+  const game = t.source === "the game";
+  const bare = (s) => String(s ?? "").replace(/\|c[0-9a-fA-F]{8}|\|r/g, "");  // WoW's inline colour codes, e.g. a crafter's name
+  const rows = t.lines.map((ln, i) => {
+    const inline = (/\|c[0-9a-fA-F]{2}([0-9a-fA-F]{6})/.exec(ln.l || "") || [])[1];
+    const c = game ? (inline || ln.c || "").toLowerCase() : "";
+    const cls = game ? "" : i === 0 ? ` t-q${q}` : /^q\d?$/.test(ln.q || "") && ln.q !== "q1" ? ` t-${ln.q}` : "";
+    const sty = game && HEX_RE.test(c) ? ` style="color:#${c}"` : "";
+    return `<div class="row${cls}"${sty}><span>${esc(bare(ln.l))}</span>${ln.r ? `<span>${esc(bare(ln.r))}</span>` : ""}</div>`;
+  }).join("");
+  const note = t.base_item_only ? `<div class="src">Worn as ${esc(g.name)}: Wowhead's tooltip lacks the random bonus. The next save brings the game's own.</div>` : "";
+  return `<div class="gtip" role="tooltip">${rows}${note}<div class="src">Tooltip from ${esc(t.source)}</div></div>`;
+}
+
+const DOLL_LEFT = ["Head", "Neck", "Shoulder", "Back", "Chest", "Shirt", "Tabard", "Wrist"];
+const DOLL_RIGHT = ["Hands", "Waist", "Legs", "Feet", "Finger 1", "Finger 2", "Trinket 1", "Trinket 2"];
+const DOLL_LOW = ["Main Hand", "Off Hand", "Ranged"];
+function renderGear(sr) {
+  const gear = val(sr.gear);
+  const el = document.getElementById("gear");
+  if (!gear) { el.innerHTML = `<p class="empty">Gear unknown in the last save.</p>`; return; }
+  const bySlot = Object.fromEntries(gear.map((g) => [g.slot, g]));
+  const slot = (s) => {
+    const g = bySlot[s];
+    if (!g) return `<div class="dslot empty"><span class="gicon" title="${esc(s)}: empty">${esc(s)}</span></div>`;
+    const q = Number.isInteger(g.quality) && g.quality >= 0 && g.quality <= 5 ? g.quality : 1;
+    const img = ICON_RE.test(g.icon || "") ? `<img src="${g.icon}" alt="" width="44" height="44">` : `<span>${esc(s)}</span>`;
+    return `<div class="dslot iq${q}"><button type="button" class="gicon" aria-label="${esc(s)}: ${esc(g.name)}" aria-expanded="false">${img}</button>${tipHtml(g, q)}</div>`;
+  };
+  const worn = gear.filter((g) => Number.isFinite(g.ilvl) && !["Shirt", "Tabard"].includes(g.slot));
+  const avg = worn.length ? Math.round(worn.reduce((a, g) => a + g.ilvl, 0) / worn.length) : null;
+  const empty = [...DOLL_LEFT, ...DOLL_RIGHT, ...DOLL_LOW].filter((s) => !bySlot[s] && GAP_SLOTS.has(s)).length;
+  const face = AVATARS.has(sr.character) ? `<img class="avatar" src="avatars/${esc(sr.character.toLowerCase())}.jpg" alt="${esc(sr.character)}">`
+    : ICON_RE.test(sr.class_icon || "") ? `<img src="${sr.class_icon}" alt="">` : "";
+  el.innerHTML = `<div class="doll"><div class="side l">${DOLL_LEFT.map(slot).join("")}</div>`
+    + `<div class="core">${face}<b>${esc(sr.character)}</b><small>Level ${esc(val(sr.level) ?? "?")} ${esc(sr.class)}</small>`
+    + (avg ? `<small>Average item level <span class="num">${avg}</span></small>` : "") + (empty ? `<small class="gap">${empty} empty slot${empty === 1 ? "" : "s"}</small>` : "")
+    + `<small>Hover or tap an item for its tooltip</small></div>`
+    + `<div class="side r">${DOLL_RIGHT.map(slot).join("")}</div><div class="weapons">${DOLL_LOW.map(slot).join("")}</div></div>`;
+  document.getElementById("upgrades").innerHTML = upgradesHtml(sr);
+  const best = sr.upgrades && (sr.upgrades.next || [])[0];
+  document.getElementById("upgAge").textContent = best ? `best: ${best.slot} +${best.gain}` : "";
+}
+
+// the player 25 Nov: per slot, what Kerana could and should enchant (worn gear only on herself; for the others the pick is for
+// the next unbound item), and the next 1-3 items by gain, the biggest first and highlighted. Computed by bin/sync.
+function upgradesHtml(sr) {
+  const u = sr.upgrades;
+  if (!u) return `<p class="empty">Enchants and next upgrades need the new game-data bridge: quit and reopen the Claude app.</p>`;
+  if (u.error) return `<p class="empty">Enchants and next upgrades unavailable: ${esc(u.error)}</p>`;
+  const short = (e) => esc(String(e || "").replace(/^Enchant [^-]+ - /, ""));
+  const ench = u.enchants || [], next = u.next || [];
+  const mine = ench.length && ench[0].can === "now";
+  return `<div class="upg">`
+    + (next.length ? `<h3>Next upgrades</h3><ol>${next.map((x, i) => `<li class="${i ? "" : "top"}"><span>${esc(x.slot)}: ${esc(x.item)}</span><span class="gain">+${esc(x.gain)}</span>`
+        + `<details class="more"><summary>more</summary><ul class="bul"><li>${esc(x.from)}</li>${x.needs ? `<li>needs level ${esc(x.needs)}</li>` : ""}`
+        + (x.stats || []).map((t) => `<li>${esc(t)}</li>`).join("") + `</ul></details></li>`).join("")}</ol>`
+      : `<p class="note">No upgrade found yet among roster stock, dungeon quest rewards and roster crafts.</p>`)
+    + (ench.length ? `<h3>Enchants by ${esc(ench[0].by)}</h3><p class="note">${mine ? "She can enchant her worn gear now." : "Worn gear is soulbound: these are for the next unbound item in each slot, before it is worn."}</p>`
+        + `<dl class="ench">${ench.map((e) => `<dt>${esc(e.slot)}</dt><dd>${e.enchant ? `has ${esc(e.enchant)} · ` : ""}${e.could ? `knows ${short(e.could)}` : "knows none"}`
+        + `${e.should ? ` · learn ${short(e.should)} <span class="muted">(${esc(e.learn)})</span>` : ""}</dd>`).join("")}</dl>` : "")
+    + (u.stats_missing ? `<p class="note">${esc(u.stats_missing)} candidate items still lack stats; the next saves fetch them.</p>` : "")
+    + `</div>`;
+}
+// Tap an icon to pin its tooltip open (phones have no hover); tap it again, or another, to close.
+document.getElementById("gear").addEventListener("click", (e) => {
+  const btn = e.target.closest("button.gicon");
+  if (!btn) return;
+  const slot = btn.closest(".dslot"), open = !slot.classList.contains("open");
+  document.querySelectorAll("#gear .dslot.open").forEach((x) => { x.classList.remove("open"); x.querySelector(".gicon").setAttribute("aria-expanded", "false"); });
+  if (open) { slot.classList.add("open"); btn.setAttribute("aria-expanded", "true"); }
+});
+
+// Professions along the top: each one's rank, its open board steps that name it, then the computed next steps
+// (trainer when capped, the next crafts) with what is missing for each.
+function renderProfs(sr) {
+  const el = document.getElementById("profs");
+  const steps = Array.isArray(sr.prof_steps) ? sr.prof_steps : null;
+  document.getElementById("profAge").textContent = sr.prof_steps && sr.prof_steps.error ? "plan unavailable"
+    : !("prof_steps" in sr) ? "next steps need the new game-data bridge: quit and reopen the Claude app" : "";
+  const ps = steps || (val(sr.professions) || []).map((p) => ({ profession: p.name, rank: p.rank, max: p.max, steps: [] }));
+  const age = document.getElementById("profAge");
+  if (!age.textContent) age.textContent = `${ps.length} profession${ps.length === 1 ? "" : "s"}`;
+  if (!ps.length) { el.innerHTML = `<p class="empty">No professions in the last save.</p>`; return; }
+  el.innerHTML = ps.map((p) => {
+    const goals = S.steps.filter((s) => s.char === sr.character && !s.done && s.text.includes(p.profession)).slice(0, 2)
+      .map((s) => ({ do: s.text, where: s.detail, missing: null }));
+    const all = [...goals, ...(p.steps || [])].slice(0, 3);
+    const capped = p.max && p.rank >= p.max && p.max < 300;
+    return `<div class="ptile ${capped ? "capped" : ""}"><div class="ph"><b>${profImg(p.profession)}${esc(p.profession)}</b><span class="num">${esc(p.rank)}/${esc(p.max)}${capped ? " capped" : ""}</span></div>`
+      + `<div class="bar"><span class="cur" style="width:${p.max ? Math.min(100, p.rank / p.max * 100) : 0}%"></span></div>`
+      + (all.length ? `<ol class="psteps">${all.map((s) => `<li>${esc(s.do)}`
+          + more(s.where)
+          + (Array.isArray(s.missing) ? (s.missing.length ? `<ul class="miss">${s.missing.map((m) => `<li>${esc(m)}</li>`).join("")}</ul>` : `<span class="have">You have the materials.</span>`) : "")
+          + `</li>`).join("")}</ol>`
+        : `<p class="none">${capped ? "Capped: train the next rank." : "No steps on record: it rises as you use it."}</p>`)
+      + `</div>`;
+  }).join("");
+}
+
+function renderExtra(sr) {
+  const bags = val(sr.bags), talents = val(sr.talents), events = val(sr.recent_money_events);
+  const el = document.getElementById("extra");
+  document.getElementById("extraAge").textContent = bags ? `${bags.length} kinds of item in the bags` : "";
+  const parts = [];
+  parts.push(bags ? `<details class="more"><summary>Bags (${bags.length} kinds of item)</summary><div class="cols2">${bags.slice().sort((a, b) => a.name.localeCompare(b.name)).map((b) => `<div>${esc(b.name)} <span class="num muted">×${esc(b.count)}</span></div>`).join("")}</div></details>` : `<p class="empty">Bags unknown.</p>`);
+  if (talents && talents.length) parts.push(`<details class="more"><summary>Talents (${talents.length})</summary><dl class="kv">${talents.map((t) => `<dt class="num">${esc(t.rank)}/${esc(t.max)}</dt><dd>${esc(t.name)}</dd>`).join("")}</dl></details>`);
+  if (events && events.length) parts.push(`<details class="more"><summary>Recent money (${events.length})</summary><dl class="kv">${events.map((e) => `<dt class="num">${esc(new Date(e.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</dt><dd>${esc(e.category.replace(/_/g, " "))} <span class="num">${esc(e.text)}</span></dd>`).join("")}</dl></details>`);
+  el.innerHTML = parts.join("");
+}
+
+function renderSteps() {
+  const el = document.getElementById("steps");
+  const prog = document.getElementById("stepsProg");
+  if (!S.db) return;
+  const mine = S.steps.filter((s) => s.char === S.sel);
+  if (!mine.length) {
+    prog.textContent = "";
+    el.innerHTML = `<p class="empty">No steps for ${esc(S.sel || "this character")} yet. Ask Claude for a plan and it appears here.</p>`;
+    return;
+  }
+  const groups = [];
+  for (const s of mine) {
+    let g = groups.find((x) => x.name === (s.group || "Other"));
+    if (!g) groups.push(g = { name: s.group || "Other", items: [] });
+    g.items.push(s);
+  }
+  const done = mine.filter((s) => s.done).length;
+  prog.textContent = `${done}/${mine.length} done`;
+  prog.className = "prog" + (done === mine.length ? " done" : "");
+  el.innerHTML = groups.map((g) => {
+    const gd = g.items.filter((s) => s.done).length;
+    const key = `${S.sel}|${g.name}`;
+    const open = key in S.openGroups ? S.openGroups[key] : gd < g.items.length;
+    return `<details class="group" data-key="${esc(key)}" ${open ? "open" : ""}><summary><span class="t">${esc(g.name)}</span><span class="prog ${gd === g.items.length ? "done" : ""}">${gd}/${g.items.length}</span></summary>
+      <ul class="steps">${g.items.map((s) => `<li class="step ${s.done ? "done" : ""}"><input type="checkbox" id="st-${esc(s.id)}" data-id="${esc(s.id)}" ${s.done ? "checked" : ""}>
+        <div><label for="st-${esc(s.id)}">${esc(s.text)}</label>${more(s.detail)}</div></li>`).join("")}</ul></details>`;
+  }).join("");
+  el.querySelectorAll("details.group").forEach((d) => d.addEventListener("toggle", () => { S.openGroups[d.dataset.key] = d.open; }));
+  el.querySelectorAll("input[type=checkbox]").forEach((c) => c.onchange = () => toggleStep(c.dataset.id, c.checked));
+}
+
+const stamp = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const t = d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? t : `${d.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })} ${t}`;
+};
+// The scratch pad: the selected character's notes, oldest first, scrolled to the newest (force: on a character switch).
+function renderNotes(force) {
+  const el = document.getElementById("jots");
+  if (!S.sel) return;
+  document.getElementById("notesHead").textContent = `Scratch pad · ${S.sel}`;
+  const mine = S.jots.filter((j) => j.char === S.sel);
+  const atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  el.innerHTML = mine.length ? mine.map((j) => `<label class="jot ${j.done ? "done" : ""}"><input type="checkbox" data-id="${esc(j.id)}" ${j.done ? "checked" : ""}>`
+      + `<span>${esc(j.text)}</span><time>${esc(stamp(j.at))}</time></label>`).join("")
+    : `<p class="empty">No notes for ${esc(S.sel)} yet.</p>`;
+  if (force || S.jotScroll || atEnd) { el.scrollTop = el.scrollHeight; S.jotScroll = false; }
+  el.querySelectorAll("input[type=checkbox]").forEach((c) => c.onchange = () => tickJot(c.dataset.id, c.checked));
+}
+
+document.getElementById("jotForm").addEventListener("submit", addJot);
+setInterval(() => { if (S.host === "live") setHost("live"); }, 30000);
+
+document.querySelectorAll("details.sec").forEach((d) => {
+  if (store.get(`wowboard.open.${d.id}`) === "1") d.open = true;
+  d.addEventListener("toggle", () => store.set(`wowboard.open.${d.id}`, d.open ? "1" : "0"));
+});
+S.sel = store.get("wowboard.sel");
+startLive();
+startDb();
+</script>
+
+</body></html>
