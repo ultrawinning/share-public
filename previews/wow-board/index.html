@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><style>body{margin:0;font:14px -apple-system,system-ui,sans-serif}img{max-width:100%}[hidden]{display:none!important}</style><script>/* Stand-in for the Claude artifact runtime, so board/wow-board.html runs as a plain web page (bin/board-publish,
    the player 27 Nov 03:36). It answers the board's own calls from data.json, which bin/board-publish rewrites after each
-   game save: mcp.callTool / mcp.watchTool for list_characters, get_character_sitrep and get_needs, and the db's
+   game save: mcp.callTool / mcp.watchTool for list_characters, get_character_sitrep, get_needs and get_stash, and the db's
    `steps` (the checklist). Read-only: notes and ticks live on the Claude board, so saving them here fails politely. */
 (() => {
   let data = null, at = 0, pending = null;
@@ -17,6 +17,7 @@
     if (tool === "list_characters") return d.list_characters;
     if (tool === "get_character_sitrep" && d.sitrep[name]) return d.sitrep[name];
     if (tool === "get_needs" && d.needs[name]) return d.needs[name];
+    if (tool === "get_stash" && d.stash) return d.stash;
     throw { code: "tool_error", message: `not in this copy: ${tool} ${name || ""}`.trim() };
   };
   const asError = (e) => (e && e.code ? e : { code: "tool_error", message: String(e) });
@@ -302,6 +303,28 @@ ul.qlist li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8p
 .side.r .dslot .gtip { left: auto; right: 52px; }
 .weapons .dslot .gtip { top: auto; bottom: 52px; left: 50%; transform: translateX(-50%); }
 .dslot:hover .gtip, .dslot:focus-within .gtip, .dslot.open .gtip { display: block; }
+/* Guild bank tab (the player 28 Nov 06:27): what to send to the bank, who gets what, bags, and a search over everyone's stock. */
+.strip .tab.stashtab { grid-template-columns: 44px minmax(0, 1fr); }
+.strip .tab.stashtab .ava { display: grid; place-items: center; font-family: var(--display); font-size: 20px; color: var(--gold); }
+.stash { display: grid; gap: 12px; }
+.stash-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.seg { display: flex; flex-wrap: wrap; gap: 6px; }
+.seg button { border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 999px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+.seg button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.stash-q { flex: 1 1 220px; max-width: 360px; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 8px; padding: 6px 10px; font: inherit; }
+.sgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 10px; align-items: start; }
+.srows { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; }
+.srows li { display: grid; gap: 1px; }
+.srows .it { font-weight: 500; }
+.srows .why { color: var(--muted); font-size: 12px; }
+.kind { font-size: 11px; border-radius: 999px; padding: 0 7px; border: 1px solid var(--line); color: var(--muted); margin-left: 6px; white-space: nowrap; }
+.kind.sell, .kind.recipe { color: var(--gold); border-color: var(--gold); }
+.kind.goal { color: var(--accent); border-color: var(--accent); }
+.kind.vendor { color: var(--q-grey); }
+.stab { width: 100%; border-collapse: collapse; font-size: 13px; }
+.stab th, .stab td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+.stab th { color: var(--muted); font-weight: 500; font-size: 12px; }
+.tablewrap { overflow-x: auto; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 
@@ -314,6 +337,9 @@ ul.qlist li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8p
   <div class="strip" id="tabs" role="tablist" aria-label="Characters"></div>
   <div class="banner" id="banner" hidden></div>
 
+  <section class="stash" id="stash" hidden aria-label="Guild bank"></section>
+
+  <div id="charView">
   <!-- The selected character as two cards side by side: picture and gear, then the profile with its scratch pad. -->
   <div class="hero">
     <section class="card kit" aria-label="Picture and gear"><div id="gear"><p class="empty">The character and its gear appear once the game data loads.</p></div></section>
@@ -348,6 +374,7 @@ ul.qlist li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8p
     <details class="sec" id="sec-extra"><summary><h2>Bags, talents and money</h2><span class="prog" id="extraAge"></span></summary>
       <div id="extra"><p class="empty">Appears once the game data loads.</p></div></details>
   </div>
+  </div>
 </div>
 
 <script>
@@ -359,7 +386,8 @@ const GAP_SLOTS = new Set(["Head", "Neck", "Shoulder", "Back", "Chest", "Wrist",
 
 const S = { chars: [], sel: null, sitreps: {}, sectionErr: {}, steps: [], jots: [], jotScroll: false, mcp: null, db: null,
   host: "connecting", watched: new Set(), openGroups: {},
-  plan: {}, planErr: {}, planFor: null, planStop: null, fetchedAt: {} };
+  plan: {}, planErr: {}, planFor: null, planStop: null, fetchedAt: {},
+  view: "char", stash: null, stashErr: null, stashAt: 0, stashTab: "send", stashQ: "", stashWatch: null };
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmt = (n) => Number(n).toLocaleString("en-US");
@@ -464,6 +492,7 @@ function onCharacters(payload) {
   for (const c of list) watchCharacter(c.name);
   renderTabs();
   watchPlan();
+  if (S.view === "stash") { watchStash(); renderStash(); }
 }
 
 /* ---------- the roster plan for the selected character (bin/kb, rebuilt after every save) ---------- */
@@ -629,25 +658,135 @@ function renderTabs() {
     const lvl = val(sr && sr.level) ?? c.level;
     const xp = sr && val(sr.xp), money = sr && val(sr.money);
     const ava = AVATARS.has(n) ? `<img class="ava" src="avatars/${esc(n.toLowerCase())}.jpg" alt="">` : `<span class="ava" aria-hidden="true"></span>`;
-    return `<button type="button" class="tab" role="tab" id="tab-${esc(n)}" aria-selected="${n === S.sel}" data-name="${esc(n)}">${ava}
+    return `<button type="button" class="tab" role="tab" id="tab-${esc(n)}" aria-selected="${n === S.sel && S.view === "char"}" data-name="${esc(n)}">${ava}
       <span class="ctop"><b>${esc(n)}</b><span class="num">${lvl != null ? "L" + esc(lvl) : ""}</span><span class="muted small">${esc((sr && sr.class) || c.class || "")}</span></span>
       <span class="mini" aria-hidden="true"><span style="width:${xp ? Math.min(100, xp.current / xp.max * 100) : 0}%"></span></span>
       <span class="meta"><span class="money">${money ? coins(money.copper) : ""}</span><span>${sr ? esc(ago(sr.snapshot_captured_at)) : ""}</span></span>
     </button>`;
-  }).join("");
-  document.querySelectorAll(".tab").forEach((b) => b.onclick = () => select(b.dataset.name));
+  }).join("") + stashTabHtml();
+  document.querySelectorAll(".tab").forEach((b) => b.onclick = () => (b.dataset.stash ? openStash() : select(b.dataset.name)));
 }
 
 function select(name) {
-  if (name === S.sel) return;
+  if (name === S.sel && S.view === "char") return;
   S.sel = name;
+  S.view = "char";
+  store.set("wowboard.view", "char");
   store.set("wowboard.sel", name);
   render();
   const tab = document.getElementById(`tab-${name}`);
   if (tab && tab.scrollIntoView) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
 }
 
-function render() { renderTabs(); renderLive(); renderSteps(); renderNotes(true); watchPlan(); renderPlan(); }
+function render() {
+  const stash = S.view === "stash";
+  document.getElementById("stash").hidden = !stash;
+  document.getElementById("charView").hidden = stash;
+  renderTabs();
+  if (stash) { watchStash(); renderStash(); return; }
+  renderLive(); renderSteps(); renderNotes(true); watchPlan(); renderPlan();
+}
+
+/* ---------- guild bank tab (the player 28 Nov 06:27): send to the bank, who gets what, bags, who has what ---------- */
+function stashTabHtml() {
+  const st = S.stash;
+  const n = st ? st.send.filter((r) => r.kind !== "vendor").length : null;
+  return `<button type="button" class="tab stashtab" role="tab" id="tab-stash" aria-selected="${S.view === "stash"}" data-stash="1">
+      <span class="ava" aria-hidden="true">&#9878;</span>
+      <span class="ctop"><b>Guild bank</b><span class="muted small">${st && st.store ? esc(st.store) : ""}</span></span>
+      <span class="meta"><span>${n != null ? `${n} to send` : "Send, needs, search"}</span><span>${S.stashAt ? esc(ago(new Date(S.stashAt).toISOString())) : ""}</span></span>
+    </button>`;
+}
+
+function openStash() {
+  if (S.view === "stash") return;
+  S.view = "stash";
+  store.set("wowboard.view", "stash");
+  render();
+}
+
+function watchStash() {
+  if (!S.mcp || S.stashWatch) return;
+  S.stashWatch = S.mcp.watchTool(SERVER, "get_stash", null, (ev) => {
+    if (ev.type === "data") {
+      S.stash = ev.result.payload; S.stashErr = null;
+      S.stashAt = (ev.result.cache && ev.result.cache.storedAt) || Date.now();
+    } else {
+      S.stashErr = (ev.error && (ev.error.message || ev.error.code)) || "unknown error";
+    }
+    if (S.view === "stash") { renderTabs(); renderStash(); }
+  }, { refetchInterval: REFRESH_MS, cache: { staleTime: REFRESH_MS - 5000, gcTime: 7 * 86400000 } });
+}
+
+const KIND = { deposit: "deposit", sell: "sell on AH", vendor: "vendor", recipe: "recipe", goal: "goal", earmark: "held in bank" };
+function srow(item, count, kind, why) {
+  return `<li><span class="it">${esc(item)} &times;${esc(count)}<span class="kind ${esc(kind)}">${esc(KIND[kind] || kind)}</span></span>${why ? `<span class="why">${esc(why)}</span>` : ""}</li>`;
+}
+function groupCards(rows, key, head, line) {
+  const groups = {};
+  rows.forEach((r) => (groups[r[key]] = groups[r[key]] || []).push(r));
+  const names = Object.keys(groups).sort();
+  return names.length ? `<div class="sgrid">${names.map((k) => `<section class="card"><div class="card-head"><h2>${esc(head(k))}</h2><span class="muted small">${groups[k].length}</span></div><ul class="srows">${groups[k].map(line).join("")}</ul></section>`).join("")}</div>` : "";
+}
+
+function renderStash() {
+  const el = document.getElementById("stash");
+  const st = S.stash;
+  if (!st) {
+    el.innerHTML = `<section class="card"><p class="empty">${S.stashErr ? "Guild bank data error: " + esc(S.stashErr) : S.mcp ? "Loading the guild bank…" : "The guild bank appears once the game data loads."}</p></section>`;
+    return;
+  }
+  const bank = st.store || "the guild bank";
+  const q = S.stashQ.trim().toLowerCase();
+  const hit = (...xs) => !q || xs.some((x) => String(x ?? "").toLowerCase().includes(q));
+  const tabs = [["send", `Send to ${bank}`], ["get", "Who gets what"], ["bags", "Bags"], ["has", "Who has what"]];
+  let body = "";
+  if (S.stashTab === "send") {
+    const mail = st.send.filter((r) => r.kind !== "vendor" && hit(r.from, r.item, r.for));
+    const junk = st.send.filter((r) => r.kind === "vendor" && hit(r.from, r.item, r.for));
+    body = (groupCards(mail, "from", (k) => `${k} → ${bank}`, (r) => srow(r.item, r.count, r.kind, [r.where, r.for].filter(Boolean).join(" · ")))
+            || `<p class="empty">Nothing to send to ${esc(bank)}${q ? " matches the search" : ""}.</p>`)
+      + (junk.length ? `<h2 class="plan-h">Sell to any vendor</h2>` + groupCards(junk, "from", (k) => k, (r) => srow(r.item, r.count, r.kind, [r.where, r.for].filter(Boolean).join(" · "))) : "");
+  } else if (S.stashTab === "get") {
+    const rows = st.deliver.filter((r) => hit(r.to, r.from, r.item, r.for));
+    body = groupCards(rows, "to", (k) => `For ${k}`, (r) => srow(r.item, r.count, r.kind, `from ${r.from}${r.kind === "earmark" ? " (already there: mail it when they need it)" : ""} · ${r.for}`))
+      || `<p class="empty">Nobody is waiting on anything${q ? " that matches the search" : ""}.</p>`;
+  } else if (S.stashTab === "bags") {
+    const slots = st.bags.slots.filter((r) => hit(r.char));
+    const spare = st.bags.spare.filter((r) => hit(r.from, r.item));
+    const needy = st.bags.slots.filter((r) => r.empty > 0).map((r) => `${r.char} (${r.empty} empty)`);
+    body = `<section class="card"><div class="card-head"><h2>Bag slots</h2></div><div class="tablewrap"><table class="stab"><thead><tr><th>Character</th><th>Empty bag slots</th><th>Smallest bag</th><th>Reagent bag</th><th>Free slots</th></tr></thead><tbody>${
+      slots.map((r) => `<tr><td>${esc(r.char)}</td><td>${esc(r.empty)}</td><td>${r.smallest ? esc(r.smallest) + " slots" : "—"}</td><td>${r.reagent_bag ? "yes" : "no"}</td><td>${r.free ?? "—"}</td></tr>`).join("")}</tbody></table></div></section>`
+      + `<section class="card"><div class="card-head"><h2>Spare bags on the roster</h2><span class="muted small">${spare.length}</span></div>`
+      + (needy.length ? `<p class="small muted">Empty slots first: ${esc(needy.join(", "))}.</p>` : "")
+      + (spare.length ? `<ul class="srows">${spare.map((r) => srow(r.item, r.count, "deposit", `${r.from} · ${r.where}`)).join("")}</ul>` : `<p class="empty">No spare bags.</p>`) + `</section>`;
+  } else {
+    const rows = st.holdings.filter((r) => hit(r.char, r.item));
+    if (!q) {
+      const by = {};
+      rows.forEach((r) => (by[r.char] = by[r.char] || []).push(r));
+      body = `<p class="small muted">Type an item or a character to search everyone's bags, bank and mail. Or open a character:</p><div class="sgrid">${
+        Object.keys(by).sort().map((c) => `<details class="card"><summary><b>${esc(c)}</b> <span class="muted small">${by[c].length} stacks</span></summary><ul class="srows">${
+          by[c].map((r) => `<li><span class="it">${esc(r.item)} &times;${esc(r.count)}</span><span class="why">${esc(r.location)}${r.bound ? " · soulbound" : ""}</span></li>`).join("")}</ul></details>`).join("")}</div>`;
+    } else {
+      const items = {};
+      rows.forEach((r) => (items[r.item] = items[r.item] || []).push(r));
+      const names = Object.keys(items).sort();
+      body = names.length ? `<div class="tablewrap"><table class="stab"><thead><tr><th>Item</th><th>Who has it</th><th>Total</th></tr></thead><tbody>${
+        names.map((it) => `<tr><td>${esc(it)}</td><td>${items[it].map((r) => `${esc(r.char)} ${esc(r.count)} (${esc(r.location)}${r.bound ? ", soulbound" : ""})`).join("; ")}</td><td>${items[it].reduce((a, r) => a + (r.count || 0), 0)}</td></tr>`).join("")}</tbody></table></div>`
+        : `<p class="empty">Nobody holds anything matching “${esc(S.stashQ)}”.</p>`;
+    }
+  }
+  const focused = document.activeElement && document.activeElement.id === "stashQ";
+  el.innerHTML = `<div class="stash-bar"><div class="seg" role="group" aria-label="Guild bank views">${
+    tabs.map(([k, label]) => `<button type="button" data-k="${k}" aria-pressed="${S.stashTab === k}">${esc(label)}</button>`).join("")}</div>
+    <input id="stashQ" class="stash-q" type="search" placeholder="Search an item or character" aria-label="Search" value="${esc(S.stashQ)}"></div>
+    <p class="small muted">${esc(st.note || "")}${S.stashAt ? " Updated " + esc(ago(new Date(S.stashAt).toISOString())) + "." : ""}</p>${body}`;
+  el.querySelectorAll(".seg button").forEach((b) => b.onclick = () => { S.stashTab = b.dataset.k; store.set("wowboard.stashTab", S.stashTab); renderStash(); });
+  const box = document.getElementById("stashQ");
+  box.oninput = () => { S.stashQ = box.value; renderStash(); };
+  if (focused) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }
+}
 
 function renderLive() {
   const sr = S.sel && S.sitreps[S.sel];
@@ -932,6 +1071,10 @@ document.querySelectorAll("details.sec").forEach((d) => {
   d.addEventListener("toggle", () => store.set(`wowboard.open.${d.id}`, d.open ? "1" : "0"));
 });
 S.sel = store.get("wowboard.sel");
+S.view = store.get("wowboard.view") === "stash" ? "stash" : "char";
+S.stashTab = ["send", "get", "bags", "has"].includes(store.get("wowboard.stashTab")) ? store.get("wowboard.stashTab") : "send";
+document.getElementById("stash").hidden = S.view !== "stash";
+document.getElementById("charView").hidden = S.view === "stash";
 startLive();
 startDb();
 </script>
