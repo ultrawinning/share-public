@@ -744,7 +744,8 @@ function renderStash() {
   if (S.stashTab === "send") {
     const mail = st.send.filter((r) => r.kind !== "vendor" && hit(r.from, r.item, r.for));
     const junk = st.send.filter((r) => r.kind === "vendor" && hit(r.from, r.item, r.for));
-    body = (groupCards(mail, "from", (k) => (k === bank ? `${bank}: list on the AH` : `${k} → ${bank}`), (r) => srow(r.item, r.count, r.kind, [r.where, r.for].filter(Boolean).join(" · ")))
+    const lane = (r) => { const to = r.to || bank; return r.kind === "sell" && r.from === to ? `${to}: list on the AH` : `${r.from} → ${to}`; };
+    body = (groupCards(mail.map((r) => ({ ...r, lane: lane(r) })), "lane", (k) => k, (r) => srow(r.item, r.count, r.kind, [r.where, r.for].filter(Boolean).join(" · ")))
             || `<p class="empty">Nothing to send to ${esc(bank)}${q ? " matches the search" : ""}.</p>`)
       + (junk.length ? `<h2 class="plan-h">Sell to any vendor</h2>` + groupCards(junk, "from", (k) => k, (r) => srow(r.item, r.count, r.kind, [r.where, r.for].filter(Boolean).join(" · "))) : "");
   } else if (S.stashTab === "get") {
